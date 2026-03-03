@@ -1,515 +1,863 @@
 """
-Radian RD-21 direct serial reader.
-This script connects directly to the Radian RD-21 over a serial port,
-sends the command to read all instant metrics for 3 phases, parses the 
-response, and saves the data to a CSV file. It uses pyserial for communication 
-and includes error handling and logging.
+radian_rd21_gui.py
+==================
+PyQt6 GUI front-end for the Radian RD-21 3-phase reader.
+
+Imports the serial driver and data types from radian_rd21_3phase.py —
+both files must be in the same directory.
+
+Install dependencies:
+    pip install pyserial PyQt6
+
+Run:
+    python radian_rd21_gui.py
 """
 
-import argparse
 import csv
-import logging
-import struct
 import sys
 import time
-from dataclasses import dataclass, fields
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
-import serial
 import serial.tools.list_ports
 
-
-# ── Logging ────────────────────────────────────────────────────────────────────
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-7s  %(message)s",
-    datefmt="%H:%M:%S",
+from PyQt6.QtCore import (
+    Qt, QThread, pyqtSignal, QTimer, QObject
 )
-log = logging.getLogger("radian_rd21")
+from PyQt6.QtGui import QFont, QColor, QPalette, QFontDatabase
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget,
+    QVBoxLayout, QHBoxLayout, QGridLayout,
+    QLabel, QPushButton, QComboBox, QLineEdit,
+    QTextEdit, QGroupBox, QFileDialog,
+    QFrame, QSizePolicy, QStatusBar,
+)
+
+# Import driver classes from the CLI script (same directory)
+from radian_rd21_3phase import (
+    RadianRD21, PhaseReading,
+    default_csv_name, readings_to_row, CSV_HEADER,
+    POLL_INTERVAL_S,
+)
 
 
-# ── Protocol constants ──────────────────────────────────────────────────────────
+# ── Colour palette ─────────────────────────────────────────────────────────────
+#
+#  Industrial / instrument dark theme — monochrome base with amber accents.
+#  Feels like real test equipment firmware.
 
-SYNC_BYTE        = 0xA6
-CMD_IDENTIFY     = 0x02
-CMD_GET_INSTANT  = 0x0D
-
-# Payload for the "read all instant metrics" command (matches what the main GUI sends)
-INSTANT_PAYLOAD  = bytes([0x00, 0x24, 0x00, 0x00, 0x00, 0x14, 0xFF, 0xFD])
-
-BYTES_PER_FLOAT  = 4
-FLOATS_PER_PHASE = 8    # volt, amp, watt, va, var, freq, phase_angle, power_factor
-NUM_PHASES       = 3
-PHASE_LABELS     = ("A", "B", "C")
-
-# Minimum payload bytes for a valid 3-phase response
-MIN_PAYLOAD_3PH  = NUM_PHASES * FLOATS_PER_PHASE * BYTES_PER_FLOAT  # 96 bytes
+BG_DEEP    = "#0D0D0D"   # window background
+BG_PANEL   = "#141414"   # group box / card background
+BG_FIELD   = "#1C1C1C"   # input field background
+BORDER     = "#2A2A2A"   # subtle borders
+AMBER      = "#F5A623"   # primary accent — readings, highlights
+AMBER_DIM  = "#7A5010"   # dimmed amber for inactive values
+GREEN_ON   = "#39D353"   # connected / running indicator
+RED_OFF    = "#E84040"   # error / stopped indicator
+TEXT_PRI   = "#F0F0F0"   # primary text
+TEXT_SEC   = "#707070"   # secondary / label text
+TEXT_LOG   = "#909090"   # log pane text
 
 
-# ── TI DSP float → Python float ────────────────────────────────────────────────
+# ── Stylesheet ─────────────────────────────────────────────────────────────────
 
-def ti_float_to_python(raw: bytes) -> float:
+STYLESHEET = f"""
+QMainWindow, QWidget {{
+    background-color: {BG_DEEP};
+    color: {TEXT_PRI};
+    font-family: "Consolas", "Courier New", monospace;
+    font-size: 12px;
+}}
+
+QGroupBox {{
+    background-color: {BG_PANEL};
+    border: 1px solid {BORDER};
+    border-radius: 4px;
+    margin-top: 18px;
+    padding: 10px 8px 8px 8px;
+    font-size: 11px;
+    color: {TEXT_SEC};
+    letter-spacing: 1px;
+    text-transform: uppercase;
+}}
+
+QGroupBox::title {{
+    subcontrol-origin: margin;
+    subcontrol-position: top left;
+    padding: 0 6px;
+    color: {TEXT_SEC};
+    font-size: 10px;
+    letter-spacing: 2px;
+}}
+
+QLabel {{
+    color: {TEXT_PRI};
+    background: transparent;
+}}
+
+QLabel.dim {{
+    color: {TEXT_SEC};
+}}
+
+QComboBox, QLineEdit {{
+    background-color: {BG_FIELD};
+    border: 1px solid {BORDER};
+    border-radius: 3px;
+    color: {TEXT_PRI};
+    padding: 4px 8px;
+    font-family: "Consolas", monospace;
+    font-size: 12px;
+}}
+
+QComboBox:hover, QLineEdit:hover {{
+    border-color: {AMBER_DIM};
+}}
+
+QComboBox:focus, QLineEdit:focus {{
+    border-color: {AMBER};
+}}
+
+QComboBox QAbstractItemView {{
+    background-color: {BG_FIELD};
+    color: {TEXT_PRI};
+    selection-background-color: {AMBER_DIM};
+    border: 1px solid {BORDER};
+}}
+
+QPushButton {{
+    background-color: {BG_FIELD};
+    border: 1px solid {BORDER};
+    border-radius: 3px;
+    color: {TEXT_PRI};
+    padding: 6px 18px;
+    font-family: "Consolas", monospace;
+    font-size: 12px;
+    letter-spacing: 1px;
+}}
+
+QPushButton:hover {{
+    border-color: {AMBER};
+    color: {AMBER};
+}}
+
+QPushButton:pressed {{
+    background-color: {AMBER_DIM};
+}}
+
+QPushButton:disabled {{
+    color: {TEXT_SEC};
+    border-color: {BORDER};
+}}
+
+QPushButton#startBtn {{
+    border-color: {GREEN_ON};
+    color: {GREEN_ON};
+    font-weight: bold;
+    letter-spacing: 2px;
+}}
+
+QPushButton#startBtn:hover {{
+    background-color: #0F2A14;
+}}
+
+QPushButton#stopBtn {{
+    border-color: {RED_OFF};
+    color: {RED_OFF};
+    font-weight: bold;
+    letter-spacing: 2px;
+}}
+
+QPushButton#stopBtn:hover {{
+    background-color: #2A0F0F;
+}}
+
+QTextEdit {{
+    background-color: {BG_FIELD};
+    border: 1px solid {BORDER};
+    border-radius: 3px;
+    color: {TEXT_LOG};
+    font-family: "Consolas", "Courier New", monospace;
+    font-size: 11px;
+    padding: 4px;
+}}
+
+QStatusBar {{
+    background-color: {BG_PANEL};
+    color: {TEXT_SEC};
+    border-top: 1px solid {BORDER};
+    font-size: 11px;
+}}
+
+QFrame#divider {{
+    background-color: {BORDER};
+}}
+"""
+
+
+# ── Value display label ─────────────────────────────────────────────────────────
+
+class ValueLabel(QLabel):
+    """Large amber numeric readout used inside phase cards."""
+
+    def __init__(self, parent=None):
+        super().__init__("---", parent)
+        self.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        font = QFont("Consolas", 20, QFont.Weight.Bold)
+        self.setFont(font)
+        self.setStyleSheet(f"color: {AMBER_DIM}; background: transparent;")
+        self._active = False
+
+    def set_value(self, value: float, fmt: str = ".3f"):
+        self.setText(format(value, fmt))
+        if not self._active:
+            self._active = True
+            self.setStyleSheet(f"color: {AMBER}; background: transparent;")
+
+    def reset(self):
+        self.setText("---")
+        self._active = False
+        self.setStyleSheet(f"color: {AMBER_DIM}; background: transparent;")
+
+
+# ── Phase card ──────────────────────────────────────────────────────────────────
+
+class PhaseCard(QGroupBox):
     """
-    Convert a 4-byte TI DSP floating-point value to a standard Python float.
-
-    TI format:
-        byte[0]        = exponent, biased by 128  (0 → value is zero)
-        byte[1] bit 7  = sign (1 = negative)
-        byte[1] bits 6-0 + byte[2] + byte[3] = 23-bit mantissa (MSB first)
-        Hidden leading 1 is implicit (same as IEEE-754 normal numbers).
-
-    This is the same logic used by ti_float_to_ieee_single in the original
-    project's src/util/data_conversion.py.
-    """
-    if len(raw) < 4:
-        return 0.0
-
-    exp = raw[0]
-    if exp == 0:
-        return 0.0
-
-    sign     = (raw[1] & 0x80) >> 7
-    # Reconstruct full 24-bit mantissa: hidden 1 + 23 explicit bits
-    mantissa = ((raw[1] & 0x7F) | 0x80) << 16 | (raw[2] << 8) | raw[3]
-    # exp is biased 128; mantissa has 23 fractional bits → subtract 23 from bias
-    value    = float(mantissa) * (2.0 ** (exp - 128 - 23))
-    return -value if sign else value
-
-
-# ── Packet framing ─────────────────────────────────────────────────────────────
-
-def _checksum(data: bytes) -> int:
-    """XOR checksum over all bytes in data."""
-    result = 0
-    for b in data:
-        result ^= b
-    return result
-
-
-def build_frame(cmd: int, payload: bytes = b"") -> bytes:
-    """
-    Build a complete Radian serial frame including sync byte and checksum.
-
-    Frame layout:
-        [0xA6] [cmd] [len_lo] [len_hi] [payload...] [checksum]
-
-    The checksum covers bytes 1 (cmd) through the last payload byte.
-    """
-    length_lo = len(payload) & 0xFF
-    length_hi = (len(payload) >> 8) & 0xFF
-    inner = bytes([cmd, length_lo, length_hi]) + payload
-    cs    = _checksum(inner)
-    return bytes([SYNC_BYTE]) + inner + bytes([cs])
-
-
-def read_response(ser: serial.Serial, timeout_s: float = 2.0) -> Optional[bytes]:
-    """
-    Read one complete response frame from the serial port.
-
-    Returns the raw payload bytes (everything between the length field and the
-    checksum byte), or None on timeout / framing error.
-    """
-    deadline = time.monotonic() + timeout_s
-
-    # Wait for sync byte
-    while time.monotonic() < deadline:
-        b = ser.read(1)
-        if not b:
-            continue
-        if b[0] == SYNC_BYTE:
-            break
-    else:
-        log.warning("Timeout waiting for sync byte 0xA6")
-        return None
-
-    # Read 3-byte header: [cmd, len_lo, len_hi]
-    header = _read_exact(ser, 3, deadline)
-    if header is None:
-        log.warning("Timeout reading response header")
-        return None
-
-    _cmd_echo = header[0]
-    data_len  = header[1] | (header[2] << 8)
-
-    # Read payload + checksum
-    body = _read_exact(ser, data_len + 1, deadline)
-    if body is None:
-        log.warning(f"Timeout reading response payload ({data_len} bytes expected)")
-        return None
-
-    payload  = body[:-1]
-    recv_cs  = body[-1]
-
-    # Verify checksum (covers cmd byte + len bytes + payload)
-    calc_cs = _checksum(header + payload)
-    if calc_cs != recv_cs:
-        log.warning(f"Checksum mismatch: calculated 0x{calc_cs:02X}, received 0x{recv_cs:02X}")
-        # Return payload anyway — checksum errors can be noise-related; let caller decide
-
-    return payload
-
-
-def _read_exact(ser: serial.Serial, n: int, deadline: float) -> Optional[bytes]:
-    """Read exactly n bytes before deadline, returning None on timeout."""
-    buf = b""
-    while len(buf) < n and time.monotonic() < deadline:
-        chunk = ser.read(n - len(buf))
-        if chunk:
-            buf += chunk
-    return buf if len(buf) == n else None
-
-
-# ── Phase data container ────────────────────────────────────────────────────────
-
-@dataclass
-class PhaseReading:
-    phase:       str   = ""
-    volt:        float = 0.0   # Volts RMS
-    amp:         float = 0.0   # Current RMS (Amps)
-    watt:        float = 0.0   # Real power (Watts)
-    var:         float = 0.0   # Reactive power (VARs)
-    va:          float = 0.0   # Apparent power (VA)
-    frequency:   float = 0.0   # Hz
-    phase_angle: float = 0.0   # Degrees
-    power_factor: float = 0.0  # unitless
-
-    def display_line(self) -> str:
-        return (
-            f"  Phase {self.phase}  |"
-            f"  V = {self.volt:9.3f} V  |"
-            f"  A = {self.amp:9.4f} A  |"
-            f"  W = {self.watt:10.3f} W  |"
-            f"  VAR = {self.var:10.3f} VAR"
-        )
-
-
-# ── Parsing ────────────────────────────────────────────────────────────────────
-
-def parse_3phase_payload(payload: bytes) -> Optional[list[PhaseReading]]:
-    """
-    Parse a 3-phase instant-metrics payload into PhaseReading objects.
-
-    Expects 3 × 8 TI floats = 96 bytes minimum.
-    If the device returns more floats per phase (e.g. 9 or 10), the extras
-    are safely ignored.
-    """
-    if len(payload) < MIN_PAYLOAD_3PH:
-        log.warning(
-            f"Payload too short for 3-phase read: {len(payload)} bytes "
-            f"(need at least {MIN_PAYLOAD_3PH}). "
-            f"Got {len(payload) // BYTES_PER_FLOAT} floats."
-        )
-        # Attempt best-effort parse with however many floats we have
-        if len(payload) < BYTES_PER_FLOAT * FLOATS_PER_PHASE:
-            return None  # not even one phase worth of data
-
-    # Decode every float in the payload
-    num_floats = len(payload) // BYTES_PER_FLOAT
-    floats: list[float] = []
-    for i in range(num_floats):
-        raw   = payload[i * BYTES_PER_FLOAT : (i + 1) * BYTES_PER_FLOAT]
-        floats.append(ti_float_to_python(raw))
-
-    log.debug(f"Decoded {num_floats} TI floats from payload")
-
-    results: list[PhaseReading] = []
-    floats_per_phase = num_floats // NUM_PHASES if num_floats >= MIN_PAYLOAD_3PH // BYTES_PER_FLOAT else FLOATS_PER_PHASE
-
-    for idx, label in enumerate(PHASE_LABELS):
-        base = idx * floats_per_phase
-
-        def f(offset: int) -> float:
-            i = base + offset
-            return floats[i] if i < len(floats) else 0.0
-
-        reading = PhaseReading(
-            phase        = label,
-            volt         = f(0),
-            amp          = f(1),
-            watt         = f(2),
-            va           = f(3),
-            var          = f(4),
-            frequency    = f(5),
-            phase_angle  = f(6),
-            power_factor = f(7),
-        )
-        results.append(reading)
-
-    return results
-
-
-# ── Radian serial driver ────────────────────────────────────────────────────────
-
-class RadianRD21:
-    """
-    Direct serial driver for the Radian RD-21 Dytronic power analyzer.
-    No backend, no REST — just pyserial.
+    One card per phase (A / B / C) showing Volts, Amps, Watts, VARs.
+    Also shows VA, Freq, Angle, PF in a smaller secondary row.
     """
 
-    def __init__(self, port: str, baud: int = 9600, read_timeout: float = 2.0):
-        self.port         = port
-        self.baud         = baud
-        self.read_timeout = read_timeout
-        self._ser: Optional[serial.Serial] = None
+    LABEL_STYLE = f"color: {TEXT_SEC}; font-size: 10px; letter-spacing: 1px; background: transparent;"
+    UNIT_STYLE  = f"color: {TEXT_SEC}; font-size: 11px; background: transparent;"
 
-    # ── connection ────────────────────────────────────────────────────────────
+    def __init__(self, phase_label: str, parent=None):
+        super().__init__(f"PHASE  {phase_label}", parent)
+        self.phase_label = phase_label
+        self._build()
 
-    def connect(self) -> bool:
-        """Open the serial port and verify the Radian responds to IDENTIFY."""
-        try:
-            self._ser = serial.Serial(
-                port     = self.port,
-                baudrate = self.baud,
-                bytesize = serial.EIGHTBITS,
-                parity   = serial.PARITY_NONE,
-                stopbits = serial.STOPBITS_ONE,
-                timeout  = 0.1,   # short read timeout — we handle blocking ourselves
-            )
-            log.info(f"Serial port {self.port} opened @ {self.baud} baud")
-        except serial.SerialException as e:
-            log.error(f"Could not open {self.port}: {e}")
-            return False
+    def _build(self):
+        layout = QVBoxLayout(self)
+        layout.setSpacing(4)
 
-        # Flush any stale data
-        self._ser.reset_input_buffer()
-        self._ser.reset_output_buffer()
+        # Primary metrics — large readouts
+        for attr, unit, fmt in [
+            ("volt",  "V",   ".3f"),
+            ("amp",   "A",   ".4f"),
+            ("watt",  "W",   ".3f"),
+            ("var",   "VAR", ".3f"),
+        ]:
+            row = QHBoxLayout()
+            lbl = QLabel(attr.upper())
+            lbl.setStyleSheet(self.LABEL_STYLE)
+            lbl.setFixedWidth(38)
 
-        # Send IDENTIFY and wait for response
-        frame = build_frame(CMD_IDENTIFY)
-        self._ser.write(frame)
-        log.debug(f"IDENTIFY sent: {frame.hex().upper()}")
+            val = ValueLabel()
+            setattr(self, f"_{attr}_val", val)
+            setattr(self, f"_{attr}_fmt", fmt)
 
-        payload = read_response(self._ser, timeout_s=self.read_timeout)
-        if payload is None:
-            log.error("Radian did not respond to IDENTIFY — check device, cable, and baud rate")
-            self.disconnect()
-            return False
+            unit_lbl = QLabel(unit)
+            unit_lbl.setStyleSheet(self.UNIT_STYLE)
+            unit_lbl.setFixedWidth(32)
 
-        ident = payload.decode("ascii", errors="replace").strip()
-        log.info(f"Radian identified: {ident!r}")
-        return True
+            row.addWidget(lbl)
+            row.addWidget(val, 1)
+            row.addWidget(unit_lbl)
+            layout.addLayout(row)
 
-    def disconnect(self) -> None:
-        if self._ser and self._ser.is_open:
-            self._ser.close()
-            log.info("Serial port closed")
-        self._ser = None
+        # Divider
+        div = QFrame()
+        div.setObjectName("divider")
+        div.setFixedHeight(1)
+        layout.addWidget(div)
 
-    def is_connected(self) -> bool:
-        return self._ser is not None and self._ser.is_open
+        # Secondary metrics — smaller
+        sec_layout = QGridLayout()
+        sec_layout.setSpacing(4)
+        for col, (attr, unit) in enumerate([
+            ("va",    "VA"),
+            ("freq",  "Hz"),
+            ("angle", "°"),
+            ("pf",    "PF"),
+        ]):
+            lbl = QLabel(attr.upper())
+            lbl.setStyleSheet(self.LABEL_STYLE)
+            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-    # ── read ──────────────────────────────────────────────────────────────────
+            val = QLabel("---")
+            val.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            val.setStyleSheet(f"color: {TEXT_SEC}; font-size: 11px; background: transparent;")
+            setattr(self, f"_{attr}_sec", val)
 
-    def read_instant_3phase(self) -> Optional[list[PhaseReading]]:
-        """
-        Send the instant-metrics command and return a list of 3 PhaseReading
-        objects [Phase A, Phase B, Phase C].
-        Returns None on communication error or parse failure.
-        """
-        if not self.is_connected():
-            log.error("Not connected — call connect() first")
-            return None
+            u = QLabel(unit)
+            u.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            u.setStyleSheet(self.UNIT_STYLE)
 
-        frame = build_frame(CMD_GET_INSTANT, INSTANT_PAYLOAD)
-        log.debug(f"GET_INSTANT sent: {frame.hex().upper()}")
+            sec_layout.addWidget(lbl, 0, col)
+            sec_layout.addWidget(val, 1, col)
+            sec_layout.addWidget(u,   2, col)
 
-        self._ser.reset_input_buffer()
-        self._ser.write(frame)
+        layout.addLayout(sec_layout)
 
-        payload = read_response(self._ser, timeout_s=self.read_timeout)
-        if payload is None:
-            log.warning("No response to GET_INSTANT command")
-            return None
+    def update(self, reading: PhaseReading):
+        self._volt_val.set_value(reading.volt,  ".3f")
+        self._amp_val.set_value(reading.amp,    ".4f")
+        self._watt_val.set_value(reading.watt,  ".3f")
+        self._var_val.set_value(reading.var,    ".3f")
 
-        log.debug(f"Response payload ({len(payload)} bytes): {payload.hex().upper()}")
-        return parse_3phase_payload(payload)
+        self._va_sec.setText(f"{reading.va:.2f}")
+        self._va_sec.setStyleSheet(f"color: {TEXT_PRI}; font-size: 11px; background: transparent;")
+        self._freq_sec.setText(f"{reading.frequency:.3f}")
+        self._freq_sec.setStyleSheet(f"color: {TEXT_PRI}; font-size: 11px; background: transparent;")
+        self._angle_sec.setText(f"{reading.phase_angle:.2f}")
+        self._angle_sec.setStyleSheet(f"color: {TEXT_PRI}; font-size: 11px; background: transparent;")
+        self._pf_sec.setText(f"{reading.power_factor:.4f}")
+        self._pf_sec.setStyleSheet(f"color: {TEXT_PRI}; font-size: 11px; background: transparent;")
 
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *_):
-        self.disconnect()
-
-
-# ── CSV writer ─────────────────────────────────────────────────────────────────
-
-CSV_HEADER = [
-    "timestamp",
-    "phase_A_volts",  "phase_A_amps",  "phase_A_watts",  "phase_A_vars",
-    "phase_A_va",     "phase_A_freq",  "phase_A_angle",  "phase_A_pf",
-    "phase_B_volts",  "phase_B_amps",  "phase_B_watts",  "phase_B_vars",
-    "phase_B_va",     "phase_B_freq",  "phase_B_angle",  "phase_B_pf",
-    "phase_C_volts",  "phase_C_amps",  "phase_C_watts",  "phase_C_vars",
-    "phase_C_va",     "phase_C_freq",  "phase_C_angle",  "phase_C_pf",
-]
+    def reset(self):
+        for attr in ("volt", "amp", "watt", "var"):
+            getattr(self, f"_{attr}_val").reset()
+        for attr in ("va", "freq", "angle", "pf"):
+            w = getattr(self, f"_{attr}_sec")
+            w.setText("---")
+            w.setStyleSheet(f"color: {TEXT_SEC}; font-size: 11px; background: transparent;")
 
 
-def readings_to_row(timestamp: str, phases: list[PhaseReading]) -> list:
-    """Flatten 3 PhaseReading objects into a single CSV row."""
-    row = [timestamp]
-    for p in phases:
-        row += [
-            f"{p.volt:.5f}",
-            f"{p.amp:.6f}",
-            f"{p.watt:.5f}",
-            f"{p.var:.5f}",
-            f"{p.va:.5f}",
-            f"{p.frequency:.4f}",
-            f"{p.phase_angle:.4f}",
-            f"{p.power_factor:.6f}",
-        ]
-    return row
+# ── Poll worker (runs in a QThread) ────────────────────────────────────────────
 
-
-def default_csv_name() -> str:
-    return f"radian_rd21_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-
-
-# ── Main polling loop ───────────────────────────────────────────────────────────
-
-def run(port: str, baud: int, count: int, interval: float, out_path: str) -> None:
+class PollWorker(QObject):
     """
-    Connect to the Radian, poll `count` times (0 = unlimited), write CSV.
+    Runs the 1-second Radian poll loop in a background QThread.
+    Emits signals back to the main thread for UI updates.
     """
-    log.info("=" * 60)
-    log.info(f"Radian RD-21  3-Phase Reader")
-    log.info(f"  Port     : {port}")
-    log.info(f"  Baud     : {baud}")
-    log.info(f"  Readings : {'unlimited (Ctrl-C to stop)' if count == 0 else count}")
-    log.info(f"  Interval : {interval} s")
-    log.info(f"  CSV out  : {out_path}")
-    log.info("=" * 60)
+    reading_ready  = pyqtSignal(list)   # list[PhaseReading]
+    error          = pyqtSignal(str)
+    stopped        = pyqtSignal()
 
-    with RadianRD21(port, baud) as radian:
-        if not radian.connect():
-            sys.exit(1)
+    def __init__(self, radian: RadianRD21):
+        super().__init__()
+        self._radian   = radian
+        self._running  = False
+        self._paused   = False
 
-        with open(out_path, "w", newline="", encoding="utf-8") as csv_file:
-            writer = csv.writer(csv_file)
-            writer.writerow(CSV_HEADER)
-            csv_file.flush()
+    def start_poll(self):
+        self._running = True
+        self._paused  = False
+        consec_errs   = 0
 
-            log.info("Connected. Starting readings — press Ctrl-C to stop early.\n")
-
-            reading_num = 0
-            errors      = 0
-
-            try:
-                while True:
-                    if count > 0 and reading_num >= count:
+        while self._running:
+            if not self._paused:
+                phases = self._radian.read_instant_3phase()
+                if phases:
+                    consec_errs = 0
+                    self.reading_ready.emit(phases)
+                else:
+                    consec_errs += 1
+                    self.error.emit(f"Read failed ({consec_errs} consecutive)")
+                    if consec_errs >= 5:
+                        self.error.emit("5 consecutive failures — stopping.")
+                        self._running = False
                         break
 
-                    phases = radian.read_instant_3phase()
-                    ts     = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+            # Interruptible 1-second sleep
+            deadline = time.monotonic() + POLL_INTERVAL_S
+            while time.monotonic() < deadline and self._running:
+                time.sleep(0.05)
 
-                    if phases:
-                        reading_num += 1
-                        errors = 0   # reset consecutive error counter on success
+        self.stopped.emit()
 
-                        # Console output
-                        print(f"\n[{ts}]  Reading #{reading_num}")
-                        for p in phases:
-                            print(p.display_line())
+    def pause(self):
+        self._paused = True
 
-                        # CSV row
-                        row = readings_to_row(ts, phases)
-                        writer.writerow(row)
-                        csv_file.flush()   # write immediately so file is usable mid-run
+    def resume(self):
+        self._paused = False
 
-                    else:
-                        errors += 1
-                        log.warning(f"Read failed (consecutive failures: {errors})")
-                        if errors >= 5:
-                            log.error("5 consecutive read failures — stopping.")
-                            break
+    def stop(self):
+        self._running = False
 
-                    if count == 0 or reading_num < count:
-                        time.sleep(interval)
 
-            except KeyboardInterrupt:
-                print()
-                log.info("Stopped by user (Ctrl-C)")
+# ── Status indicator ────────────────────────────────────────────────────────────
 
-    # Summary
-    print()
-    log.info(f"Done. {reading_num} reading(s) written to: {out_path}")
+class StatusDot(QLabel):
+    """Small coloured circle indicating connected/running state."""
+
+    def __init__(self, parent=None):
+        super().__init__("●", parent)
+        self.setFont(QFont("Arial", 14))
+        self.set_off()
+
+    def set_off(self):
+        self.setStyleSheet(f"color: {TEXT_SEC}; background: transparent;")
+        self.setToolTip("Disconnected")
+
+    def set_connected(self):
+        self.setStyleSheet(f"color: {AMBER}; background: transparent;")
+        self.setToolTip("Connected")
+
+    def set_running(self):
+        self.setStyleSheet(f"color: {GREEN_ON}; background: transparent;")
+        self.setToolTip("Running")
+
+    def set_error(self):
+        self.setStyleSheet(f"color: {RED_OFF}; background: transparent;")
+        self.setToolTip("Error")
+
+
+# ── Main window ─────────────────────────────────────────────────────────────────
+
+class MainWindow(QMainWindow):
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Radian RD-21  ·  3-Phase Monitor")
+        self.setMinimumSize(980, 640)
+
+        self._radian:      Optional[RadianRD21] = None
+        self._worker:      Optional[PollWorker] = None
+        self._thread:      Optional[QThread]    = None
+        self._csv_file     = None
+        self._csv_writer   = None
+        self._csv_path:    str  = ""
+        self._reading_num: int  = 0
+        self._start_time:  Optional[float] = None
+        self._paused:      bool = False
+
+        self._build_ui()
+        self.setStyleSheet(STYLESHEET)
+        self._refresh_ports()
+
+        # Clock timer — updates elapsed time display every second
+        self._clock = QTimer()
+        self._clock.timeout.connect(self._tick_clock)
+        self._clock.start(1000)
+
+    # ── UI construction ────────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QVBoxLayout(central)
+        root.setContentsMargins(12, 12, 12, 8)
+        root.setSpacing(10)
+
+        # ── Top bar: title + status dot ───────────────────────────────────────
+        top_bar = QHBoxLayout()
+        title = QLabel("RD-21  DYTRONIC")
+        title.setFont(QFont("Consolas", 16, QFont.Weight.Bold))
+        title.setStyleSheet(f"color: {AMBER}; letter-spacing: 3px; background: transparent;")
+        subtitle = QLabel("3-PHASE POWER MONITOR")
+        subtitle.setStyleSheet(f"color: {TEXT_SEC}; font-size: 10px; letter-spacing: 4px; background: transparent;")
+        sub_col = QVBoxLayout()
+        sub_col.setSpacing(0)
+        sub_col.addWidget(title)
+        sub_col.addWidget(subtitle)
+        top_bar.addLayout(sub_col)
+        top_bar.addStretch()
+        self._status_dot = StatusDot()
+        self._status_label = QLabel("OFFLINE")
+        self._status_label.setStyleSheet(f"color: {TEXT_SEC}; font-size: 11px; letter-spacing: 2px; background: transparent;")
+        top_bar.addWidget(self._status_dot)
+        top_bar.addSpacing(6)
+        top_bar.addWidget(self._status_label)
+        root.addLayout(top_bar)
+
+        # ── Connection panel ──────────────────────────────────────────────────
+        conn_group = QGroupBox("Connection")
+        conn_layout = QHBoxLayout(conn_group)
+        conn_layout.setSpacing(8)
+
+        conn_layout.addWidget(QLabel("Port"))
+        self._port_combo = QComboBox()
+        self._port_combo.setMinimumWidth(120)
+        conn_layout.addWidget(self._port_combo)
+
+        self._refresh_btn = QPushButton("↺")
+        self._refresh_btn.setFixedWidth(32)
+        self._refresh_btn.setToolTip("Refresh port list")
+        self._refresh_btn.clicked.connect(self._refresh_ports)
+        conn_layout.addWidget(self._refresh_btn)
+
+        conn_layout.addSpacing(12)
+        conn_layout.addWidget(QLabel("Baud"))
+        self._baud_combo = QComboBox()
+        self._baud_combo.addItems(["9600", "19200", "38400", "57600", "115200"])
+        self._baud_combo.setCurrentText("9600")
+        self._baud_combo.setMinimumWidth(90)
+        conn_layout.addWidget(self._baud_combo)
+
+        conn_layout.addSpacing(12)
+        conn_layout.addWidget(QLabel("CSV Output"))
+        self._csv_edit = QLineEdit()
+        self._csv_edit.setPlaceholderText("auto-named  (click ⋯ to choose)")
+        self._csv_edit.setMinimumWidth(240)
+        conn_layout.addWidget(self._csv_edit, 1)
+        self._browse_btn = QPushButton("⋯")
+        self._browse_btn.setFixedWidth(32)
+        self._browse_btn.setToolTip("Choose output file")
+        self._browse_btn.clicked.connect(self._browse_csv)
+        conn_layout.addWidget(self._browse_btn)
+
+        conn_layout.addSpacing(16)
+        self._connect_btn = QPushButton("CONNECT")
+        self._connect_btn.setMinimumWidth(100)
+        self._connect_btn.clicked.connect(self._on_connect)
+        conn_layout.addWidget(self._connect_btn)
+
+        root.addWidget(conn_group)
+
+        # ── Phase cards ───────────────────────────────────────────────────────
+        cards_layout = QHBoxLayout()
+        cards_layout.setSpacing(10)
+        self._phase_cards: dict[str, PhaseCard] = {}
+        for label in ("A", "B", "C"):
+            card = PhaseCard(label)
+            card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+            self._phase_cards[label] = card
+            cards_layout.addWidget(card)
+        root.addLayout(cards_layout)
+
+        # ── Control + stats row ───────────────────────────────────────────────
+        ctrl_row = QHBoxLayout()
+        ctrl_row.setSpacing(10)
+
+        # Start / Stop / Pause buttons
+        self._start_btn = QPushButton("▶  START")
+        self._start_btn.setObjectName("startBtn")
+        self._start_btn.setFixedHeight(36)
+        self._start_btn.setEnabled(False)
+        self._start_btn.clicked.connect(self._on_start)
+        ctrl_row.addWidget(self._start_btn)
+
+        self._pause_btn = QPushButton("⏸  PAUSE")
+        self._pause_btn.setFixedHeight(36)
+        self._pause_btn.setEnabled(False)
+        self._pause_btn.clicked.connect(self._on_pause)
+        ctrl_row.addWidget(self._pause_btn)
+
+        self._stop_btn = QPushButton("■  STOP")
+        self._stop_btn.setObjectName("stopBtn")
+        self._stop_btn.setFixedHeight(36)
+        self._stop_btn.setEnabled(False)
+        self._stop_btn.clicked.connect(self._on_stop)
+        ctrl_row.addWidget(self._stop_btn)
+
+        ctrl_row.addSpacing(16)
+
+        # Stats display
+        stats_group = QGroupBox("Session")
+        stats_layout = QHBoxLayout(stats_group)
+        stats_layout.setSpacing(24)
+
+        for attr, caption in [
+            ("_lbl_readings", "READINGS"),
+            ("_lbl_elapsed",  "ELAPSED"),
+            ("_lbl_csv",      "CSV FILE"),
+        ]:
+            col = QVBoxLayout()
+            col.setSpacing(2)
+            cap = QLabel(caption)
+            cap.setStyleSheet(f"color: {TEXT_SEC}; font-size: 9px; letter-spacing: 2px; background: transparent;")
+            val = QLabel("—")
+            val.setStyleSheet(f"color: {TEXT_PRI}; font-size: 13px; background: transparent;")
+            if attr == "_lbl_csv":
+                val.setMaximumWidth(300)
+            col.addWidget(cap)
+            col.addWidget(val)
+            setattr(self, attr, val)
+            stats_layout.addLayout(col)
+
+        stats_layout.addStretch()
+        ctrl_row.addWidget(stats_group, 1)
+
+        root.addLayout(ctrl_row)
+
+        # ── Log pane ──────────────────────────────────────────────────────────
+        log_group = QGroupBox("Log")
+        log_layout = QVBoxLayout(log_group)
+        log_layout.setContentsMargins(6, 6, 6, 6)
+        self._log_pane = QTextEdit()
+        self._log_pane.setReadOnly(True)
+        self._log_pane.setMaximumHeight(130)
+        log_layout.addWidget(self._log_pane)
+        root.addWidget(log_group)
+
+        # ── Status bar ────────────────────────────────────────────────────────
+        self._status_bar = QStatusBar()
+        self.setStatusBar(self._status_bar)
+        self._status_bar.showMessage("Select a port and click CONNECT to begin.")
+
+    # ── Port helpers ───────────────────────────────────────────────────────────
+
+    def _refresh_ports(self):
+        ports = [p.device for p in serial.tools.list_ports.comports()]
+        self._port_combo.clear()
+        if ports:
+            self._port_combo.addItems(ports)
+            self._log(f"Found {len(ports)} port(s): {', '.join(ports)}")
+        else:
+            self._log("No serial ports detected.")
+
+    def _browse_csv(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Choose CSV output file",
+            default_csv_name(),
+            "CSV Files (*.csv);;All Files (*)",
+        )
+        if path:
+            self._csv_edit.setText(path)
+
+    # ── Connect / disconnect ───────────────────────────────────────────────────
+
+    def _on_connect(self):
+        if self._radian and self._radian.is_connected():
+            self._disconnect()
+        else:
+            self._connect()
+
+    def _connect(self):
+        port = self._port_combo.currentText()
+        if not port:
+            self._log("ERROR: No port selected.")
+            return
+        baud = int(self._baud_combo.currentText())
+
+        self._log(f"Connecting to {port} @ {baud} baud…")
+        self._status_bar.showMessage(f"Connecting to {port}…")
+
+        self._radian = RadianRD21(port, baud)
+        if self._radian.connect():
+            self._log(f"Connected to Radian on {port}.")
+            self._status_dot.set_connected()
+            self._status_label.setText("CONNECTED")
+            self._connect_btn.setText("DISCONNECT")
+            self._start_btn.setEnabled(True)
+            self._port_combo.setEnabled(False)
+            self._baud_combo.setEnabled(False)
+            self._status_bar.showMessage(f"Connected — {port} @ {baud}. Ready to start.")
+        else:
+            self._log(f"ERROR: Could not connect to {port}. Check device and baud rate.")
+            self._status_dot.set_error()
+            self._status_label.setText("ERROR")
+            self._radian = None
+            self._status_bar.showMessage("Connection failed.")
+
+    def _disconnect(self):
+        if self._worker:
+            self._stop_worker_immediate()
+        if self._radian:
+            self._radian.disconnect()
+            self._radian = None
+        self._status_dot.set_off()
+        self._status_label.setText("OFFLINE")
+        self._connect_btn.setText("CONNECT")
+        self._start_btn.setEnabled(False)
+        self._port_combo.setEnabled(True)
+        self._baud_combo.setEnabled(True)
+        self._log("Disconnected.")
+        self._status_bar.showMessage("Disconnected.")
+
+    # ── Start / pause / stop ───────────────────────────────────────────────────
+
+    def _on_start(self):
+        if not self._radian or not self._radian.is_connected():
+            self._log("ERROR: Not connected.")
+            return
+
+        # Determine CSV path
+        path = self._csv_edit.text().strip() or default_csv_name()
+        self._csv_path = path
+        self._lbl_csv.setText(Path(path).name)
+
+        # Open CSV
+        try:
+            self._csv_file   = open(path, "w", newline="", encoding="utf-8")
+            self._csv_writer = csv.writer(self._csv_file)
+            self._csv_writer.writerow(CSV_HEADER)
+            self._csv_file.flush()
+        except OSError as e:
+            self._log(f"ERROR: Cannot open CSV file: {e}")
+            return
+
+        self._reading_num = 0
+        self._start_time  = time.monotonic()
+        self._paused      = False
+        self._lbl_readings.setText("0")
+        self._lbl_elapsed.setText("00:00:00")
+
+        # Start worker thread
+        self._worker = PollWorker(self._radian)
+        self._thread = QThread()
+        self._worker.moveToThread(self._thread)
+        self._thread.started.connect(self._worker.start_poll)
+        self._worker.reading_ready.connect(self._on_reading)
+        self._worker.error.connect(self._on_worker_error)
+        self._worker.stopped.connect(self._on_worker_stopped)
+        self._thread.start()
+
+        self._start_btn.setEnabled(False)
+        self._pause_btn.setEnabled(True)
+        self._stop_btn.setEnabled(True)
+        self._connect_btn.setEnabled(False)
+        self._status_dot.set_running()
+        self._status_label.setText("RUNNING")
+        self._log(f"Started. Writing to: {path}")
+        self._status_bar.showMessage(f"Running — {path}")
+
+    def _on_pause(self):
+        if not self._worker:
+            return
+        if not self._paused:
+            self._worker.pause()
+            self._paused = True
+            self._pause_btn.setText("▶  RESUME")
+            self._status_dot.set_connected()
+            self._status_label.setText("PAUSED")
+            self._log("Paused.")
+            self._status_bar.showMessage("Paused — click RESUME to continue.")
+        else:
+            self._worker.resume()
+            self._paused = False
+            self._pause_btn.setText("⏸  PAUSE")
+            self._status_dot.set_running()
+            self._status_label.setText("RUNNING")
+            self._log("Resumed.")
+            self._status_bar.showMessage("Running.")
+
+    def _on_stop(self):
+        """Stop button handler — asks for confirmation before stopping."""
+        if not self._worker:
+            return
+
+        from PyQt6.QtWidgets import QMessageBox
+        dlg = QMessageBox(self)
+        dlg.setWindowTitle("Stop Session")
+        dlg.setText("Stop the current reading session?")
+        dlg.setInformativeText(
+            f"{self._reading_num} reading(s) recorded so far.\n"
+            "The CSV will be saved and closed."
+        )
+        dlg.setStandardButtons(
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel
+        )
+        dlg.setDefaultButton(QMessageBox.StandardButton.Cancel)
+        dlg.setStyleSheet(STYLESHEET)
+
+        if dlg.exec() == QMessageBox.StandardButton.Yes:
+            self._stop_worker_immediate()
+
+    def _stop_worker_immediate(self):
+        """Stop the poll worker without confirmation (used by closeEvent)."""
+        if self._worker:
+            self._worker.stop()
+            # _on_worker_stopped() handles cleanup once the thread finishes
+
+    def _on_worker_stopped(self):
+        if self._thread:
+            self._thread.quit()
+            self._thread.wait()
+            self._thread = None
+        self._worker = None
+
+        if self._csv_file:
+            self._csv_file.flush()
+            self._csv_file.close()
+            self._csv_file   = None
+            self._csv_writer = None
+            self._log(f"CSV saved: {self._csv_path} ({self._reading_num} readings)")
+
+        self._start_btn.setEnabled(True)
+        self._pause_btn.setEnabled(False)
+        self._pause_btn.setText("⏸  PAUSE")
+        self._stop_btn.setEnabled(False)
+        self._connect_btn.setEnabled(True)
+        self._paused = False
+
+        if self._radian and self._radian.is_connected():
+            self._status_dot.set_connected()
+            self._status_label.setText("CONNECTED")
+        else:
+            self._status_dot.set_off()
+            self._status_label.setText("OFFLINE")
+
+        self._status_bar.showMessage(
+            f"Stopped. {self._reading_num} reading(s) written to {self._csv_path}"
+        )
+
+    # ── Data handlers ──────────────────────────────────────────────────────────
+
+    def _on_reading(self, phases: list):
+        self._reading_num += 1
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
+        # Update phase cards
+        for p in phases:
+            card = self._phase_cards.get(p.phase)
+            if card:
+                card.update(p)
+
+        # Write CSV
+        if self._csv_writer and self._csv_file:
+            self._csv_writer.writerow(readings_to_row(ts, phases))
+            self._csv_file.flush()
+
+        # Update stats
+        self._lbl_readings.setText(str(self._reading_num))
+
+        # Log line
+        parts = [f"#{self._reading_num:>5}  {ts}"]
+        for p in phases:
+            parts.append(
+                f"  Ph{p.phase}: {p.volt:8.3f}V  {p.amp:8.4f}A"
+                f"  {p.watt:9.3f}W  {p.var:9.3f}VAR"
+            )
+        self._log("  ".join(parts))
+
+    def _on_worker_error(self, msg: str):
+        self._log(f"WARN  {msg}")
+        self._status_bar.showMessage(f"Warning: {msg}")
+
+    # ── Clock ──────────────────────────────────────────────────────────────────
+
+    def _tick_clock(self):
+        if self._start_time and not self._paused:
+            elapsed = time.monotonic() - self._start_time
+            m, s = divmod(int(elapsed), 60)
+            h, m = divmod(m, 60)
+            self._lbl_elapsed.setText(f"{h:02d}:{m:02d}:{s:02d}")
+
+    # ── Log helper ─────────────────────────────────────────────────────────────
+
+    def _log(self, msg: str):
+        ts  = datetime.now().strftime("%H:%M:%S")
+        self._log_pane.append(f"<span style='color:{TEXT_SEC}'>{ts}</span>  {msg}")
+        sb = self._log_pane.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+    # ── Close event ────────────────────────────────────────────────────────────
+
+    def closeEvent(self, event):
+        if self._worker:
+            self._worker.stop()
+            if self._thread:
+                self._thread.quit()
+                self._thread.wait()
+        if self._csv_file:
+            self._csv_file.flush()
+            self._csv_file.close()
+        if self._radian:
+            self._radian.disconnect()
+        event.accept()
 
 
 # ── Entry point ─────────────────────────────────────────────────────────────────
 
-def list_ports_helper():
-    ports = [p.device for p in serial.tools.list_ports.comports()]
-    if ports:
-        print("Available serial ports:")
-        for p in ports:
-            print(f"  {p}")
-    else:
-        print("No serial ports detected.")
-
-
 def main():
-    parser = argparse.ArgumentParser(
-        description="Read Phase A/B/C Volts, Amps, Watts, VARs from a Radian RD-21 and save to CSV.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    parser.add_argument(
-        "--port", "-p",
-        help="Serial port, e.g. COM5 or /dev/ttyUSB0. Use --list-ports to see options.",
-    )
-    parser.add_argument(
-        "--baud", "-b",
-        type=int, default=9600,
-        help="Baud rate.",
-    )
-    parser.add_argument(
-        "--count", "-n",
-        type=int, default=10,
-        help="Number of readings to take. Use 0 for unlimited (stop with Ctrl-C).",
-    )
-    parser.add_argument(
-        "--interval", "-i",
-        type=float, default=1.0,
-        help="Seconds between each reading.",
-    )
-    parser.add_argument(
-        "--out", "-o",
-        default=None,
-        help="Output CSV file path. Defaults to radian_rd21_YYYYMMDD_HHMMSS.csv",
-    )
-    parser.add_argument(
-        "--list-ports",
-        action="store_true",
-        help="List available serial ports and exit.",
-    )
-    parser.add_argument(
-        "--debug",
-        action="store_true",
-        help="Enable DEBUG-level logging (shows raw hex frames).",
-    )
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
 
-    args = parser.parse_args()
-
-    if args.debug:
-        logging.getLogger().setLevel(logging.DEBUG)
-
-    if args.list_ports:
-        list_ports_helper()
-        sys.exit(0)
-
-    if not args.port:
-        parser.error("--port is required. Use --list-ports to see available ports.")
-
-    out_path = args.out or default_csv_name()
-
-    run(
-        port     = args.port,
-        baud     = args.baud,
-        count    = args.count,
-        interval = args.interval,
-        out_path = out_path,
-    )
+    win = MainWindow()
+    win.show()
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":

@@ -1,0 +1,13 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Radian RD-21 Reader",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/radian_rd21.py",
+            "args": ["--port", "COM5", "--baud", "9600"],
+            "console": "integratedTerminal"
+        }
+    ]
+}
