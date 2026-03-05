@@ -14,6 +14,7 @@ Run:
 """
 
 import csv
+import logging
 import sys
 import time
 from datetime import datetime
@@ -31,7 +32,7 @@ from PyQt6.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QPushButton, QComboBox, QLineEdit,
     QTextEdit, QGroupBox, QFileDialog,
-    QFrame, QSizePolicy, QStatusBar,
+    QFrame, QSizePolicy, QStatusBar, QCheckBox,
 )
 
 # Import driver classes from the CLI script (same directory)
@@ -193,6 +194,28 @@ QFrame#divider {{
     background-color: {BORDER};
 }}
 """
+
+
+# ── GUI logging handler ─────────────────────────────────────────────────────────
+
+class QLogHandler(logging.Handler, QObject):
+    """
+    Routes Python log records from the radian_rd21 logger into the GUI log pane.
+    Thread-safe: the signal crosses the worker→main thread boundary automatically.
+    """
+    _sig = pyqtSignal(str, str)   # (level, message)
+
+    def __init__(self, callback):
+        logging.Handler.__init__(self)
+        QObject.__init__(self)
+        self._sig.connect(callback)
+
+    def emit(self, record: logging.LogRecord):
+        try:
+            msg = self.format(record)
+            self._sig.emit(record.levelname, msg)
+        except Exception:
+            self.handleError(record)
 
 
 # ── Value display label ─────────────────────────────────────────────────────────
@@ -421,6 +444,7 @@ class MainWindow(QMainWindow):
         self._reading_num: int  = 0
         self._start_time:  Optional[float] = None
         self._paused:      bool = False
+        self._log_handler: Optional[QLogHandler] = None
 
         self._build_ui()
         self.setStyleSheet(STYLESHEET)
@@ -481,7 +505,7 @@ class MainWindow(QMainWindow):
         conn_layout.addWidget(QLabel("Baud"))
         self._baud_combo = QComboBox()
         self._baud_combo.addItems(["9600", "19200", "38400", "57600", "115200"])
-        self._baud_combo.setCurrentText("9600python")
+        self._baud_combo.setCurrentText("9600")
         self._baud_combo.setMinimumWidth(90)
         conn_layout.addWidget(self._baud_combo)
 
@@ -502,6 +526,18 @@ class MainWindow(QMainWindow):
         self._connect_btn.setMinimumWidth(100)
         self._connect_btn.clicked.connect(self._on_connect)
         conn_layout.addWidget(self._connect_btn)
+
+        conn_layout.addSpacing(12)
+        self._debug_chk = QCheckBox("DEBUG")
+        self._debug_chk.setToolTip(
+            "Log raw serial frames and float decoding to the log pane.\n"
+            "Useful for diagnosing wrong values or failed reads."
+        )
+        self._debug_chk.setStyleSheet(
+            f"color: {TEXT_SEC}; font-size: 11px; letter-spacing: 1px;"
+        )
+        self._debug_chk.toggled.connect(self._on_debug_toggled)
+        conn_layout.addWidget(self._debug_chk)
 
         root.addWidget(conn_group)
 
@@ -585,6 +621,34 @@ class MainWindow(QMainWindow):
         self._status_bar = QStatusBar()
         self.setStatusBar(self._status_bar)
         self._status_bar.showMessage("Select a port and click CONNECT to begin.")
+
+    # ── Debug logging ──────────────────────────────────────────────────────────
+
+    def _on_debug_toggled(self, enabled: bool):
+        radian_log = logging.getLogger("radian_rd21")
+        if enabled:
+            if self._log_handler is None:
+                fmt = logging.Formatter("%(levelname)-5s  %(message)s")
+                self._log_handler = QLogHandler(self._log_raw)
+                self._log_handler.setFormatter(fmt)
+                self._log_handler.setLevel(logging.DEBUG)
+                radian_log.addHandler(self._log_handler)
+            radian_log.setLevel(logging.DEBUG)
+            self._log("DEBUG mode ON — raw frames and floats will appear below.")
+        else:
+            if self._log_handler:
+                radian_log.removeHandler(self._log_handler)
+                self._log_handler = None
+            radian_log.setLevel(logging.INFO)
+            self._log("DEBUG mode OFF.")
+
+    def _log_raw(self, level: str, msg: str):
+        colour = AMBER_DIM if level in ("DEBUG",) else TEXT_SEC
+        self._log_pane.append(
+            f"<span style='color:{colour}; font-size:10px;'>{msg}</span>"
+        )
+        sb = self._log_pane.verticalScrollBar()
+        sb.setValue(sb.maximum())
 
     # ── Port helpers ───────────────────────────────────────────────────────────
 
