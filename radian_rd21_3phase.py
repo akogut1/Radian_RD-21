@@ -1,634 +1,708 @@
 """
 radian_rd21_3phase.py
 =====================
+Standalone script to communicate directly with a Radian RD-21 Dytronic
+power analyzer over serial (RS-232 / USB-serial adapter).
 
-Radian RD-21 / Dytronic serial driver.
+Reads per-phase instant metrics for Phase A, B, and C every second:
+    - Volts (V)
+    - Current / Amps (A)
+    - Watts (W)
+    - VARs (VAR)
 
-This version fixes your issue by using the VB-style bulk read:
-  [0Dh] Read Instantaneous Metrics (RD-3x ALL)
+Runs continuously until the user types a command or presses Ctrl-C.
+All readings are written to a timestamped CSV file.
 
-Why:
-- Your per-metric [2Eh] reads can return 0.0 / nonsense for some indices (VOLTS/VAR),
-  while [0Dh] returns the whole RD-3x instantaneous metric table reliably.
-- We then auto-detect which metric index corresponds to:
-    VOLTS, AMPS, WATTS, VA, VAR, FREQ, ANGLE, PF
-  by matching your live conditions (~240V, 30A, 60Hz, ~7.2kW).
+NO backend, NO REST API, NO existing project imports required.
+Only dependency beyond the standard library: pyserial
 
-Frame format:
-  Start(1) + PacketType(1) + Length(2, big-endian) + Data(N) + Checksum(2, big-endian)
+Install:
+    pip install pyserial
 
-Checksum:
-  16-bit SUM of all bytes from Start through last Data byte (mod 0x10000), stored big-endian.
+Usage:
+    python radian_rd21_3phase.py --port COM5 --baud 9600
+    python radian_rd21_3phase.py --port COM5 --baud 9600 --out my_test.csv
+    python radian_rd21_3phase.py --list-ports
 
-[0Dh] Read Instantaneous Metrics (RD-3x ALL):
-  Request (data words):
-    Control(0x0040) + StartIndex(0x0000) + Count(0x0014) + Terminator(0xFFFD)
+Commands (type while readings are running, then press Enter):
+    stop   / quit  — save CSV and exit
+    pause          — temporarily halt readings (port stays open)
+    resume         — resume after a pause
+    status         — print reading count, elapsed time, and last values
+    save           — manually flush/checkpoint the CSV right now
+    help           — show this command list
 
-  Example TX (without checksum shown here):
-    A6 0D 00 08 00 40 00 00 00 14 FF FD  ....
+─────────────────────────────────────────────────────────────────────────────
+Radian Serial Protocol Overview
+─────────────────────────────────────────────────────────────────────────────
+The RD-21 uses a simple framed packet format over RS-232.
 
-Response:
-  Typically returns Count metrics, each metric is 5 TI-C3x floats (20 bytes):
-    metric_i: slot0 slot1 slot2 slot3 slot4
-  Total payload len often = Count * 20 bytes (e.g., 0x14 * 20 = 400 bytes)
+Packet structure (sent and received):
+    Byte 0      : 0xA6  — sync / start-of-frame marker
+    Byte 1      : Command byte
+    Byte 2      : Data length low byte  (little-endian 16-bit length)
+    Byte 3      : Data length high byte
+    Byte 4..N-1 : Data payload (N = 4 + data_length bytes of payload)
+    Byte N      : Checksum — XOR of bytes 1 through N-1
 
-Slots are typically:
-  slot0=PhaseA, slot1=PhaseB, slot2=PhaseC, slot3=Reserved, slot4=Net
-Single-phase quirk:
-  sometimes live value is in slot3 or slot4; we remap heuristically.
+Commands used here:
+    0x02  IDENTIFY    — no data, device responds with firmware/model string
+    0x0D  GET_INSTANT — request instant measurement packet
 
-Also includes [2Eh] Read Instantaneous Metric (single index) as fallback.
+The instant-metrics command payload for "all channels, all phases":
+    Data = [0x00, 0x26, 0x00, 0x00, 0x00, 0x14, 0xFF, 0xFD]
+    (8 bytes → length field = 0x0008)
+    Full frame before checksum: A6 0D 08 00  00 26 00 00 00 14 FF FD
+    Checksum = XOR(0x0D, 0x08, 0x00, 0x00, 0x26, 0x00, 0x00, 0x00, 0x14, 0xFF, 0xFD)
+
+    Control word 0x0026 = bits 1+2+5 set:
+      Bit 1 = Volts
+      Bit 2 = Amps, Watts, VA, VARs
+      Bit 5 = Frequency, Phase Angle, Power Factor
+    (Original 0x0024 was missing bit 1, so Volts were never returned)
+
+Response payload contains TI DSP 32-bit floats.
+For a 3-phase meter the payload is 3 blocks of 8 floats (96 bytes):
+    Block 0 (Phase A): volt, amp, watt, va, var, freq, phase_angle, power_factor
+    Block 1 (Phase B): same order
+    Block 2 (Phase C): same order
+
+TI 32-bit float format (NOT standard IEEE-754):
+    Byte 0 : exponent  (biased by 128)
+    Byte 1 : sign (MSB) + mantissa bits 22..16
+    Byte 2 : mantissa bits 15..8
+    Byte 3 : mantissa bits 7..0
+─────────────────────────────────────────────────────────────────────────────
 """
 
+import argparse
+import csv
 import logging
-import os as _os
-import struct
+import queue
+import sys
+import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Optional
 
 import serial
-
-log = logging.getLogger(__name__)
-
-_DEBUG_FRAMES = _os.environ.get("RADIAN_DEBUG", "0") == "1"
-if _DEBUG_FRAMES:
-    logging.basicConfig(
-        level=logging.DEBUG,
-        format="%(asctime)s  %(levelname)-5s  %(message)s",
-        datefmt="%H:%M:%S",
-    )
-    log.info("RADIAN_DEBUG enabled — raw frame hex will be printed")
+import serial.tools.list_ports
 
 
-def _hex(b: bytes) -> str:
-    return " ".join(f"{x:02X}" for x in b)
+# ── Logging ────────────────────────────────────────────────────────────────────
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-7s  %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("radian_rd21")
+
+POLL_INTERVAL_S = 1.0   # seconds between each read from the device
+
+HELP_TEXT = """
+  Commands (press Enter after typing):
+    stop  / quit   — save CSV and exit
+    pause          — pause readings (port stays open)
+    resume         — resume after pause
+    status         — show reading count, elapsed time, last values
+    save           — flush / checkpoint the CSV right now
+    help           — show this list
+"""
 
 
-POLL_INTERVAL_S: float = 1.0
+# ── Protocol constants ──────────────────────────────────────────────────────────
 
-CSV_HEADER = [
-    "timestamp",
-    "phase_A_volt", "phase_A_amp", "phase_A_watt", "phase_A_va", "phase_A_var",
-    "phase_A_freq", "phase_A_angle", "phase_A_pf",
-    "phase_B_volt", "phase_B_amp", "phase_B_watt", "phase_B_va", "phase_B_var",
-    "phase_B_freq", "phase_B_angle", "phase_B_pf",
-    "phase_C_volt", "phase_C_amp", "phase_C_watt", "phase_C_va", "phase_C_var",
-    "phase_C_freq", "phase_C_angle", "phase_C_pf",
-]
+SYNC_BYTE        = 0xA6
+CMD_IDENTIFY     = 0x02
+CMD_GET_INSTANT  = 0x0D
 
+# Payload for the "read all instant metrics" command (matches what the main GUI sends)
+INSTANT_PAYLOAD  = bytes([0x00, 0x26, 0x00, 0x00, 0x00, 0x14, 0xFF, 0xFD])
+
+BYTES_PER_FLOAT  = 4
+FLOATS_PER_PHASE = 8    # volt, amp, watt, va, var, freq, phase_angle, power_factor
+NUM_PHASES       = 3
+PHASE_LABELS     = ("A", "B", "C")
+
+# Minimum payload bytes for a valid 3-phase response
+MIN_PAYLOAD_3PH  = NUM_PHASES * FLOATS_PER_PHASE * BYTES_PER_FLOAT  # 96 bytes
+
+
+# ── TI DSP float → Python float ────────────────────────────────────────────────
+
+def ti_float_to_python(raw: bytes) -> float:
+    """
+    Convert a 4-byte TI DSP floating-point value to a standard Python float.
+
+    TI format:
+        byte[0]        = exponent, biased by 128  (0 → value is zero)
+        byte[1] bit 7  = sign (1 = negative)
+        byte[1] bits 6-0 + byte[2] + byte[3] = 23-bit mantissa (MSB first)
+        Hidden leading 1 is implicit (same as IEEE-754 normal numbers).
+
+    Same logic as ti_float_to_ieee_single in the original project's
+    src/util/data_conversion.py.
+    """
+    if len(raw) < 4:
+        return 0.0
+
+    exp = raw[0]
+    if exp == 0:
+        return 0.0
+
+    sign     = (raw[1] & 0x80) >> 7
+    mantissa = ((raw[1] & 0x7F) | 0x80) << 16 | (raw[2] << 8) | raw[3]
+    value    = float(mantissa) * (2.0 ** (exp - 128 - 23))
+    return -value if sign else value
+
+
+# ── Packet framing ─────────────────────────────────────────────────────────────
+
+def build_frame(cmd: int, payload: bytes = b"") -> bytes:
+    """
+    Build a complete Radian serial frame.
+
+    Frame layout:  [0xA6] [cmd] [len_hi] [len_lo] [payload...]
+    Length is big-endian 16-bit.  NO checksum byte — the RD-21 does not use one.
+
+    Verified against the known-working commands from the original project:
+      IDENTIFY:  A6 02 00 00
+      INSTANT:   A6 0D 00 08  00 26 00 00 00 14 FF FD
+    """
+    length_hi = (len(payload) >> 8) & 0xFF
+    length_lo = len(payload) & 0xFF
+    return bytes([SYNC_BYTE, cmd, length_hi, length_lo]) + payload
+
+
+def read_response(ser: serial.Serial, timeout_s: float = 2.0) -> Optional[bytes]:
+    """
+    Read one complete response frame from the serial port.
+
+    Frame layout:  [0xA6] [cmd_echo] [len_hi] [len_lo] [payload...]
+    Big-endian 16-bit length.  No checksum byte.
+
+    Returns the raw payload bytes, or None on timeout / framing error.
+    """
+    deadline = time.monotonic() + timeout_s
+
+    # Wait for sync byte 0xA6
+    while time.monotonic() < deadline:
+        b = ser.read(1)
+        if not b:
+            continue
+        if b[0] == SYNC_BYTE:
+            break
+    else:
+        log.warning("Timeout waiting for sync byte 0xA6")
+        return None
+
+    # Read 3-byte header: [cmd_echo] [len_hi] [len_lo]
+    header = _read_exact(ser, 3, deadline)
+    if header is None:
+        log.warning("Timeout reading response header")
+        return None
+
+    # Length is big-endian
+    data_len = (header[1] << 8) | header[2]
+    log.debug(f"Response: cmd_echo=0x{header[0]:02X} payload_len={data_len}")
+
+    if data_len == 0:
+        return b""
+
+    payload = _read_exact(ser, data_len, deadline)
+    if payload is None:
+        log.warning(f"Timeout reading response payload ({data_len} bytes expected)")
+        return None
+
+    return payload
+
+
+def _read_exact(ser: serial.Serial, n: int, deadline: float) -> Optional[bytes]:
+    """Read exactly n bytes before deadline, returning None on timeout."""
+    buf = b""
+    while len(buf) < n and time.monotonic() < deadline:
+        chunk = ser.read(n - len(buf))
+        if chunk:
+            buf += chunk
+    return buf if len(buf) == n else None
+
+
+# ── Phase data container ────────────────────────────────────────────────────────
 
 @dataclass
 class PhaseReading:
-    phase: str
-    volt: float
-    amp: float
-    watt: float
-    va: float
-    var: float
-    frequency: float
-    phase_angle: float
-    power_factor: float
+    phase:        str   = ""
+    volt:         float = 0.0   # Volts RMS
+    amp:          float = 0.0   # Current RMS (Amps)
+    watt:         float = 0.0   # Real power (Watts)
+    var:          float = 0.0   # Reactive power (VARs)
+    va:           float = 0.0   # Apparent power (VA)
+    frequency:    float = 0.0   # Hz
+    phase_angle:  float = 0.0   # Degrees
+    power_factor: float = 0.0   # unitless
+
+    def display_line(self) -> str:
+        return (
+            f"  Phase {self.phase}  |"
+            f"  V = {self.volt:9.3f} V  |"
+            f"  A = {self.amp:9.4f} A  |"
+            f"  W = {self.watt:10.3f} W  |"
+            f"  VAR = {self.var:10.3f} VAR"
+        )
 
 
-def default_csv_name() -> str:
-    return datetime.now().strftime("radian_rd21_%Y%m%d_%H%M%S.csv")
+# ── Parsing ────────────────────────────────────────────────────────────────────
 
-
-def readings_to_row(timestamp: str, phases: List[PhaseReading]) -> list:
-    row = [timestamp]
-    for p in phases:
-        row.extend([
-            p.volt, p.amp, p.watt, p.va, p.var,
-            p.frequency, p.phase_angle, p.power_factor,
-        ])
-    return row
-
-
-# IEEE single-precision FLT_MAX
-_FLT_MAX = 3.4028234663852886e38
-
-
-def ti_c3x_float(be4: bytes) -> float:
+def parse_3phase_payload(payload: bytes) -> Optional[list[PhaseReading]]:
     """
-    Convert RD / TMS320C3x 32-bit float bytes -> Python float.
+    Parse a 3-phase instant-metrics payload into PhaseReading objects.
 
-    On the wire it is BIG-ENDIAN:
-      b0 = exponent (signed 8-bit, two's complement). 0x80 (-128) represents 0.
-      b1 = sign(bit7) + mantissa[22:16] (7 bits)
-      b2 = mantissa[15:8]
-      b3 = mantissa[7:0]
+    Expects 3 × 8 TI floats = 96 bytes minimum.
+    If the device returns more floats per phase (e.g. 9 or 10), the extras
+    are safely ignored.
     """
-    if len(be4) != 4:
-        raise ValueError("TI float requires exactly 4 bytes")
+    if len(payload) < MIN_PAYLOAD_3PH:
+        log.warning(
+            f"Payload too short for 3-phase read: {len(payload)} bytes "
+            f"(need at least {MIN_PAYLOAD_3PH}). "
+            f"Got {len(payload) // BYTES_PER_FLOAT} floats."
+        )
+        # Attempt best-effort parse with however many floats we have
+        if len(payload) < BYTES_PER_FLOAT * FLOATS_PER_PHASE:
+            return None  # not even one phase worth of data
 
-    b0, b1, b2, b3 = be4[0], be4[1], be4[2], be4[3]
+    # Decode every float in the payload
+    num_floats = len(payload) // BYTES_PER_FLOAT
+    floats: list[float] = []
+    for i in range(num_floats):
+        raw   = payload[i * BYTES_PER_FLOAT : (i + 1) * BYTES_PER_FLOAT]
+        floats.append(ti_float_to_python(raw))
 
-    if (b0, b1, b2, b3) == (0x00, 0x00, 0x00, 0x00):
-        return 0.0
+    log.debug(f"Decoded {num_floats} TI floats from payload")
 
-    if b0 in (0x80, 0x81):
-        return 0.0
+    results: list[PhaseReading] = []
+    floats_per_phase = num_floats // NUM_PHASES if num_floats >= MIN_PAYLOAD_3PH // BYTES_PER_FLOAT else FLOATS_PER_PHASE
 
-    if (b0, b1, b2, b3) == (0x7F, 0x7F, 0xFF, 0xFF):
-        return _FLT_MAX
+    for idx, label in enumerate(PHASE_LABELS):
+        base = idx * floats_per_phase
 
-    mantissa = ((b1 & 0x7F) << 16) | (b2 << 8) | b3
-    neg = (b1 & 0x80) != 0
-    exp = b0 if b0 < 0x80 else b0 - 0x100
+        def f(offset: int) -> float:
+            i = base + offset
+            return floats[i] if i < len(floats) else 0.0
 
-    if exp == 0 and mantissa == 0 and not neg:
-        return 0.0
+        reading = PhaseReading(
+            phase        = label,
+            volt         = f(0),
+            amp          = f(1),
+            watt         = f(2),
+            va           = f(3),
+            var          = f(4),
+            frequency    = f(5),
+            phase_angle  = f(6),
+            power_factor = f(7),
+        )
+        results.append(reading)
 
-    if (b0 == 0x7F) and neg and (mantissa == 0):
-        return -_FLT_MAX
+    return results
 
-    if not neg:
-        bits = (((exp + 0x7F) << 23) | mantissa) & 0x7FFFFFFF
-    elif mantissa != 0:
-        twos = ((~mantissa) + 1) & 0x7FFFFF
-        bits = twos | 0x80000000 | ((exp + 0x7F) << 23)
-    else:
-        bits = 0x80000000 | ((exp + 0x80) << 23)
 
-    return struct.unpack("<f", struct.pack("<I", bits & 0xFFFFFFFF))[0]
-
+# ── Radian serial driver ────────────────────────────────────────────────────────
 
 class RadianRD21:
-    # Packet types
-    CMD_IDENTIFY = 0x02
-    CMD_INST_METRIC_RD3X = 0x2E
-    CMD_INST_METRICS_BLOCK_RD3X = 0x0D
+    """
+    Direct serial driver for the Radian RD-21 Dytronic power analyzer.
+    No backend, no REST — just pyserial.
+    """
 
-    # Start byte families
-    _START_HINIBBLES = (0xA0, 0xB0, 0xC0, 0xD0)
-    _START_LONIBBLES = (0x3, 0x6, 0x9, 0xC)
-
-    def __init__(self, port: str, baud: int = 57600):
-        self.port = port
-        self.baud = baud
+    def __init__(self, port: str, baud: int = 9600, read_timeout: float = 2.0):
+        self.port         = port
+        self.baud         = baud
+        self.read_timeout = read_timeout
         self._ser: Optional[serial.Serial] = None
 
-        # Auto map discovered at runtime
-        self.metric_map: Optional[Dict[str, int]] = None
-
-    # ── Connection ──────────────────────────────────────────────────────────────
+    # ── connection ────────────────────────────────────────────────────────────
 
     def connect(self) -> bool:
+        """Open the serial port and verify the Radian responds to IDENTIFY."""
         try:
             self._ser = serial.Serial(
-                port=self.port,
-                baudrate=self.baud,
-                bytesize=8,
-                parity="N",
-                stopbits=1,
-                timeout=1.0,
-                write_timeout=1.0,
+                port     = self.port,
+                baudrate = self.baud,
+                bytesize = serial.EIGHTBITS,
+                parity   = serial.PARITY_NONE,
+                stopbits = serial.STOPBITS_ONE,
+                timeout  = 0.1,   # short read timeout — we handle blocking ourselves
             )
-            try:
-                self._ser.dtr = True
-                self._ser.rts = True
-            except Exception:
-                pass
-
-            try:
-                self._ser.reset_input_buffer()
-                self._ser.reset_output_buffer()
-            except Exception:
-                pass
-
-            log.info("Opened %s @ %d baud", self.port, self.baud)
-            return True
-        except serial.SerialException as exc:
-            log.error("connect failed: %s", exc)
-            self._ser = None
+            log.info(f"Serial port {self.port} opened @ {self.baud} baud")
+        except serial.SerialException as e:
+            log.error(f"Could not open {self.port}: {e}")
             return False
 
-    def disconnect(self):
+        # Flush any stale data
+        self._ser.reset_input_buffer()
+        self._ser.reset_output_buffer()
+
+        # Send IDENTIFY and wait for response
+        frame = build_frame(CMD_IDENTIFY)
+        self._ser.write(frame)
+        log.debug(f"IDENTIFY sent: {frame.hex().upper()}")
+
+        payload = read_response(self._ser, timeout_s=self.read_timeout)
+        if payload is None:
+            log.error("Radian did not respond to IDENTIFY — check device, cable, and baud rate")
+            self.disconnect()
+            return False
+
+        ident = payload.decode("ascii", errors="replace").strip()
+        log.info(f"Radian identified: {ident!r}")
+        return True
+
+    def disconnect(self) -> None:
         if self._ser and self._ser.is_open:
             self._ser.close()
-            log.info("Port closed")
+            log.info("Serial port closed")
         self._ser = None
 
     def is_connected(self) -> bool:
         return self._ser is not None and self._ser.is_open
 
-    # ── Frame I/O ───────────────────────────────────────────────────────────────
+    # ── read ──────────────────────────────────────────────────────────────────
 
-    @staticmethod
-    def _sum16(data: bytes) -> int:
-        return sum(data) & 0xFFFF
-
-    @classmethod
-    def _is_start_byte(cls, v: int) -> bool:
-        return (v & 0xF0) in cls._START_HINIBBLES and (v & 0x0F) in cls._START_LONIBBLES
-
-    def _build_frame(self, start: int, packet_type: int, data: bytes) -> bytes:
-        n = len(data)
-        hdr = bytes([start, packet_type, (n >> 8) & 0xFF, n & 0xFF])
-        body = hdr + data
-        cs = self._sum16(body)
-        return body + bytes([(cs >> 8) & 0xFF, cs & 0xFF])
-
-    def _read_exact(self, n: int) -> bytes:
-        chunks = []
-        got = 0
-        while got < n:
-            b = self._ser.read(n - got)
-            if not b:
-                break
-            chunks.append(b)
-            got += len(b)
-        return b"".join(chunks)
-
-    def _read_frame(self) -> Optional[Tuple[int, int, bytes]]:
-        if not self._ser:
-            return None
-
-        start = None
-        for _ in range(4096):
-            b = self._ser.read(1)
-            if not b:
-                return None
-            v = b[0]
-            if self._is_start_byte(v):
-                start = v
-                break
-        if start is None:
-            return None
-
-        hdr = self._read_exact(3)  # type + len_hi + len_lo
-        if len(hdr) != 3:
-            return None
-
-        packet_type = hdr[0]
-        length = (hdr[1] << 8) | hdr[2]
-
-        payload = self._read_exact(length)
-        if len(payload) != length:
-            return None
-
-        cs_bytes = self._read_exact(2)
-        if len(cs_bytes) != 2:
-            return None
-        cs_rx = (cs_bytes[0] << 8) | cs_bytes[1]
-
-        body = bytes([start]) + hdr + payload
-        cs_calc = self._sum16(body)
-        if cs_calc != cs_rx:
-            if _DEBUG_FRAMES:
-                log.debug("Checksum mismatch: calc=%04X rx=%04X body=%s", cs_calc, cs_rx, _hex(body))
-            return None
-
-        return start, packet_type, payload
-
-    # ── Slot mapping ────────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _map_slots_to_phases(slots: List[float]) -> Tuple[float, float, float]:
-        s0, s1, s2, s3, s4 = slots
-
-        def nz(x: float) -> bool:
-            return abs(x) > 1e-9
-
-        if nz(s0) or nz(s1) or nz(s2):
-            return s0, s1, s2
-
-        if nz(s3) and not nz(s4):
-            return s3, 0.0, 0.0
-
-        if nz(s4) and not nz(s3):
-            return s4, 0.0, 0.0
-
-        if nz(s3) and nz(s4):
-            return s3, 0.0, 0.0
-
-        return 0.0, 0.0, 0.0
-
-    # ── [2Eh] single-index read (fallback) ─────────────────────────────────────
-
-    def _read_inst_metric_2e(self, metric_index: int) -> Optional[Tuple[float, float, float]]:
+    def read_instant_3phase(self) -> Optional[list[PhaseReading]]:
+        """
+        Send the instant-metrics command and return a list of 3 PhaseReading
+        objects [Phase A, Phase B, Phase C].
+        Returns None on communication error or parse failure.
+        """
         if not self.is_connected():
+            log.error("Not connected — call connect() first")
             return None
 
-        data = bytes([(metric_index >> 8) & 0xFF, metric_index & 0xFF]) + b"\xFF\xFD"
-        frame = self._build_frame(0xA6, self.CMD_INST_METRIC_RD3X, data)
+        frame = build_frame(CMD_GET_INSTANT, INSTANT_PAYLOAD)
+        log.debug(f"GET_INSTANT sent: {frame.hex().upper()}")
 
+        self._ser.reset_input_buffer()
+        self._ser.write(frame)
+
+        payload = read_response(self._ser, timeout_s=self.read_timeout)
+        if payload is None:
+            log.warning("No response to GET_INSTANT command")
+            return None
+
+        log.debug(f"Response payload ({len(payload)} bytes): {payload.hex().upper()}")
+        return parse_3phase_payload(payload)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.disconnect()
+
+
+# ── CSV writer ─────────────────────────────────────────────────────────────────
+
+CSV_HEADER = [
+    "timestamp",
+    "phase_A_volts",  "phase_A_amps",  "phase_A_watts",  "phase_A_vars",
+    "phase_A_va",     "phase_A_freq",  "phase_A_angle",  "phase_A_pf",
+    "phase_B_volts",  "phase_B_amps",  "phase_B_watts",  "phase_B_vars",
+    "phase_B_va",     "phase_B_freq",  "phase_B_angle",  "phase_B_pf",
+    "phase_C_volts",  "phase_C_amps",  "phase_C_watts",  "phase_C_vars",
+    "phase_C_va",     "phase_C_freq",  "phase_C_angle",  "phase_C_pf",
+]
+
+
+def readings_to_row(timestamp: str, phases: list[PhaseReading]) -> list:
+    """Flatten 3 PhaseReading objects into a single CSV row."""
+    row = [timestamp]
+    for p in phases:
+        row += [
+            f"{p.volt:.5f}",
+            f"{p.amp:.6f}",
+            f"{p.watt:.5f}",
+            f"{p.var:.5f}",
+            f"{p.va:.5f}",
+            f"{p.frequency:.4f}",
+            f"{p.phase_angle:.4f}",
+            f"{p.power_factor:.6f}",
+        ]
+    return row
+
+
+def default_csv_name() -> str:
+    return f"radian_rd21_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+
+
+# ── Background input thread ─────────────────────────────────────────────────────
+
+def _input_thread(cmd_queue: queue.Queue) -> None:
+    """
+    Runs in a daemon thread. Blocks on input() waiting for the user to type
+    a command, then puts the lowercased string onto cmd_queue.
+    The poll loop drains this queue every second without ever blocking on input.
+    """
+    while True:
         try:
-            self._ser.reset_input_buffer()
-            self._ser.write(frame)
-            self._ser.flush()
-        except serial.SerialException as exc:
-            log.error("Write error: %s", exc)
-            return None
+            line = input()          # blocks here until user presses Enter
+            cmd_queue.put(line.strip().lower())
+        except EOFError:
+            # stdin closed (e.g. piped input finished) — treat as stop
+            cmd_queue.put("stop")
+            break
 
-        if _DEBUG_FRAMES:
-            log.debug("TX 2E idx=%d: %s", metric_index, _hex(frame))
 
-        resp = self._read_frame()
-        if resp is None:
-            return None
+# ── Command handler ─────────────────────────────────────────────────────────────
 
-        start, ptype, payload = resp
+def handle_command(
+    cmd: str,
+    *,
+    paused: list,                     # mutable single-element list used as a flag
+    reading_num: list,
+    start_time: float,
+    last_phases: list,
+    csv_file,
+) -> bool:
+    """
+    Process one user command. Returns True if the session should stop.
 
-        if _DEBUG_FRAMES:
-            log.debug("RX 2E idx=%d start=%02X type=%02X len=%d payload=%s", metric_index, start, ptype, len(payload), _hex(payload))
+    Uses mutable lists as simple pass-by-reference flags so this function
+    can update state that lives in run().
+    """
+    if cmd in ("stop", "quit", "q", "exit"):
+        print("\n[CMD] Stopping — saving CSV and disconnecting...")
+        return True  # signal run() to exit the loop
 
-        if (start & 0x0F) == 0x9:
-            if len(payload) >= 2:
-                err = (payload[0] << 8) | payload[1]
-                log.warning("Device error ACK for 2E idx=%d: code=0x%04X", metric_index, err)
-            return None
+    elif cmd == "pause":
+        if paused[0]:
+            print("[CMD] Already paused. Type 'resume' to continue.")
+        else:
+            paused[0] = True
+            print("[CMD] Paused. Readings halted. Type 'resume' to continue.")
 
-        if ptype != self.CMD_INST_METRIC_RD3X:
-            return None
+    elif cmd == "resume":
+        if not paused[0]:
+            print("[CMD] Not currently paused.")
+        else:
+            paused[0] = False
+            print("[CMD] Resumed. Readings continuing every second.")
 
-        if len(payload) != 0x14:
-            return None
+    elif cmd == "status":
+        elapsed = time.monotonic() - start_time
+        mins, secs = divmod(int(elapsed), 60)
+        hrs,  mins = divmod(mins, 60)
+        print(f"\n[STATUS] ── {datetime.now().strftime('%H:%M:%S')} ─────────────────")
+        print(f"  Readings recorded : {reading_num[0]}")
+        print(f"  Elapsed time      : {hrs:02d}:{mins:02d}:{secs:02d}")
+        print(f"  State             : {'PAUSED' if paused[0] else 'RUNNING'}")
+        if last_phases[0]:
+            print("  Last values:")
+            for p in last_phases[0]:
+                print(f"  {p.display_line()}")
+        else:
+            print("  Last values       : none yet")
+        print()
 
-        slots = [ti_c3x_float(payload[i:i + 4]) for i in range(0, 20, 4)]
-        return self._map_slots_to_phases(slots)
+    elif cmd == "save":
+        if csv_file:
+            csv_file.flush()
+            print(f"[CMD] CSV flushed — {reading_num[0]} row(s) saved to disk.")
+        else:
+            print("[CMD] No CSV file open.")
 
-    # ── [0Dh] bulk read (preferred) ────────────────────────────────────────────
+    elif cmd in ("help", "h", "?"):
+        print(HELP_TEXT)
 
-    def _read_inst_block_0d(self, control: int = 0x0040, start_index: int = 0x0000, count: int = 0x0014) -> Optional[List[List[float]]]:
-        """
-        Returns metrics as a list:
-          metrics[i] = [slot0, slot1, slot2, slot3, slot4]  (TI floats decoded)
-        where i corresponds to metric index (start_index + i + 1) in the RD-3x table.
+    elif cmd == "":
+        pass  # user just pressed Enter — ignore silently
 
-        If the device returns an error ACK (A9), returns None.
-        """
-        if not self.is_connected():
-            return None
+    else:
+        print(f"[CMD] Unknown command: '{cmd}'.  Type 'help' for a list.")
 
-        data = struct.pack(">HHHH", control, start_index, count, 0xFFFD)  # 8 bytes
-        frame = self._build_frame(0xA6, self.CMD_INST_METRICS_BLOCK_RD3X, data)
+    return False  # keep running
 
-        try:
-            self._ser.reset_input_buffer()
-            self._ser.write(frame)
-            self._ser.flush()
-        except serial.SerialException as exc:
-            log.error("Write error: %s", exc)
-            return None
 
-        if _DEBUG_FRAMES:
-            log.debug("TX 0D: %s", _hex(frame))
+# ── Main polling loop ───────────────────────────────────────────────────────────
 
-        resp = self._read_frame()
-        if resp is None:
-            return None
+def run(port: str, baud: int, out_path: str) -> None:
+    """
+    Connect to the Radian, poll every second, write CSV.
+    Runs until the user types 'stop'/'quit' or presses Ctrl-C.
+    """
+    log.info("=" * 60)
+    log.info("Radian RD-21  3-Phase Continuous Reader")
+    log.info(f"  Port    : {port}")
+    log.info(f"  Baud    : {baud}")
+    log.info(f"  CSV out : {out_path}")
+    log.info("=" * 60)
 
-        start, ptype, payload = resp
+    with RadianRD21(port, baud) as radian:
+        if not radian.connect():
+            sys.exit(1)
 
-        if _DEBUG_FRAMES:
-            log.debug("RX 0D start=%02X type=%02X len=%d", start, ptype, len(payload))
-            if len(payload) <= 64:
-                log.debug("RX 0D payload: %s", _hex(payload))
+        with open(out_path, "w", newline="", encoding="utf-8") as csv_file:
+            writer = csv.writer(csv_file)
+            writer.writerow(CSV_HEADER)
+            csv_file.flush()
 
-        # error ACK
-        if (start & 0x0F) == 0x9:
-            if len(payload) >= 2:
-                err = (payload[0] << 8) | payload[1]
-                log.warning("Device returned error ACK for 0D: code=0x%04X", err)
-            return None
+            print(HELP_TEXT)
+            log.info("Connected. Polling every second — type a command and press Enter.\n")
 
-        if ptype != self.CMD_INST_METRICS_BLOCK_RD3X:
-            return None
+            # Shared state (mutable containers so handle_command can modify them)
+            reading_num  = [0]       # [int]
+            paused       = [False]   # [bool]
+            last_phases  = [None]    # [Optional[list[PhaseReading]]]
+            consec_errs  = 0
+            start_time   = time.monotonic()
 
-        # Most common format: count metrics * 20 bytes
-        expected = count * 20
-        if len(payload) < expected:
-            # Some firmwares may return fewer; fail safely.
-            if _DEBUG_FRAMES:
-                log.debug("0D payload too short: got %d expected %d", len(payload), expected)
-            return None
+            # Start the background input thread — it's a daemon so it dies
+            # automatically when the main thread exits.
+            cmd_queue: queue.Queue = queue.Queue()
+            t = threading.Thread(target=_input_thread, args=(cmd_queue,), daemon=True)
+            t.start()
 
-        metrics: List[List[float]] = []
-        off = 0
-        for _ in range(count):
-            chunk = payload[off:off + 20]
-            slots = [ti_c3x_float(chunk[i:i + 4]) for i in range(0, 20, 4)]
-            metrics.append(slots)
-            off += 20
+            try:
+                while True:
+                    # ── drain any pending commands first ──────────────────────
+                    stop_requested = False
+                    while not cmd_queue.empty():
+                        cmd = cmd_queue.get_nowait()
+                        stop_requested = handle_command(
+                            cmd,
+                            paused=paused,
+                            reading_num=reading_num,
+                            start_time=start_time,
+                            last_phases=last_phases,
+                            csv_file=csv_file,
+                        )
+                        if stop_requested:
+                            break
+                    if stop_requested:
+                        break
 
-        return metrics
+                    # ── skip read if paused ───────────────────────────────────
+                    if paused[0]:
+                        time.sleep(POLL_INTERVAL_S)
+                        continue
 
-    # ── Auto-detection of metric indices ───────────────────────────────────────
+                    # ── poll the device ───────────────────────────────────────
+                    phases = radian.read_instant_3phase()
+                    ts     = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
 
-    @staticmethod
-    def _pick_best(candidates: Dict[int, float], predicate, target: float, name: str) -> Optional[int]:
-        best_idx = None
-        best_err = None
-        for idx, val in candidates.items():
-            if not predicate(val):
-                continue
-            err = abs(val - target)
-            if best_err is None or err < best_err:
-                best_err = err
-                best_idx = idx
-        return best_idx
+                    if phases:
+                        reading_num[0] += 1
+                        consec_errs     = 0
+                        last_phases[0]  = phases
 
-    def autodetect_metric_map(self,
-                              expected_volts: float = 241.0,
-                              expected_amps: float = 30.0,
-                              expected_freq: float = 60.0,
-                              expected_watts: float = 7200.0) -> Optional[Dict[str, int]]:
-        """
-        Build a map from label->metric_index using [0Dh] bulk read.
-        Returns None if bulk read is unsupported.
-        """
-        metrics = self._read_inst_block_0d()
-        if metrics is None:
-            return None
+                        # Console
+                        print(f"\n[{ts}]  Reading #{reading_num[0]}")
+                        for p in phases:
+                            print(p.display_line())
 
-        # Metric indices are 1-based (Table), we requested start_index=0, so:
-        # metrics[0] == index 1, metrics[1] == index 2, ...
-        phaseA_vals: Dict[int, float] = {}
-        for i, slots in enumerate(metrics):
-            a, _, _ = self._map_slots_to_phases(slots)
-            phaseA_vals[i + 1] = a
+                        # CSV — flushed immediately so file is usable mid-run
+                        writer.writerow(readings_to_row(ts, phases))
+                        csv_file.flush()
 
-        if _DEBUG_FRAMES:
-            log.debug("autodetect probe (Phase-A): %s", phaseA_vals)
+                    else:
+                        consec_errs += 1
+                        log.warning(f"Read failed (consecutive failures: {consec_errs})")
+                        if consec_errs >= 5:
+                            log.error("5 consecutive read failures — stopping.")
+                            break
 
-        # Identify the obvious ones
-        freq_idx = self._pick_best(
-            phaseA_vals,
-            predicate=lambda v: 45.0 < v < 70.0,
-            target=expected_freq,
-            name="FREQ",
-        )
-        amps_idx = self._pick_best(
-            phaseA_vals,
-            predicate=lambda v: 0.5 < v < 200.0,
-            target=expected_amps,
-            name="AMPS",
-        )
-        volts_idx = self._pick_best(
-            phaseA_vals,
-            predicate=lambda v: 50.0 < abs(v) < 600.0,
-            target=expected_volts,
-            name="VOLTS",
-        )
-        watts_idx = self._pick_best(
-            phaseA_vals,
-            predicate=lambda v: 100.0 < abs(v) < 1_000_000.0,
-            target=expected_watts,
-            name="WATTS",
-        )
+                    # ── wait 1 second before next poll ───────────────────────
+                    # Sleep in small increments so a 'stop' command is noticed
+                    # within ~0.1 s rather than waiting out the full second.
+                    next_poll = time.monotonic() + POLL_INTERVAL_S
+                    while time.monotonic() < next_poll:
+                        time.sleep(0.05)
+                        # Peek at the queue mid-sleep so stop responds instantly
+                        if not cmd_queue.empty():
+                            peek = cmd_queue.queue[0]
+                            if peek in ("stop", "quit", "q", "exit"):
+                                break
 
-        # PF near 1.0
-        pf_idx = self._pick_best(
-            phaseA_vals,
-            predicate=lambda v: 0.0 < v <= 1.5,
-            target=1.0,
-            name="PF",
-        )
+            except KeyboardInterrupt:
+                print()
+                log.info("Stopped by Ctrl-C")
 
-        # Angle is usually small-ish degrees
-        angle_idx = self._pick_best(
-            phaseA_vals,
-            predicate=lambda v: -180.0 <= v <= 180.0,
-            target=0.0,
-            name="ANGLE",
-        )
+    # ── summary ───────────────────────────────────────────────────────────────
+    elapsed = time.monotonic() - start_time
+    mins, secs = divmod(int(elapsed), 60)
+    hrs,  mins = divmod(mins, 60)
+    print()
+    log.info(f"Session complete.")
+    log.info(f"  Readings written : {reading_num[0]}")
+    log.info(f"  Elapsed time     : {hrs:02d}:{mins:02d}:{secs:02d}")
+    log.info(f"  CSV saved to     : {out_path}")
 
-        # VA tends to be near watts, slightly above
-        va_idx = None
-        if watts_idx is not None:
-            wv = phaseA_vals[watts_idx]
-            va_idx = self._pick_best(
-                phaseA_vals,
-                predicate=lambda v: 100.0 < abs(v) < 1_000_000.0,
-                target=abs(wv) * 1.01,
-                name="VA",
-            )
 
-        # VAR is what's left with magnitude reasonable (not freq/amps/volts/watts/va/pf/angle)
-        used = {x for x in [freq_idx, amps_idx, volts_idx, watts_idx, va_idx, pf_idx, angle_idx] if x}
-        var_idx = None
-        var_candidates = {k: v for k, v in phaseA_vals.items() if k not in used}
-        if var_candidates:
-            # Prefer magnitude smaller than VA, and not insane sentinels
-            def ok(v: float) -> bool:
-                if abs(v) >= 1e20:
-                    return False
-                return abs(v) < 500_000.0
+# ── Entry point ─────────────────────────────────────────────────────────────────
 
-            # If power factor is near 1, VAR should be relatively small compared to VA.
-            target_var = 0.0
-            var_idx = self._pick_best(
-                var_candidates,
-                predicate=ok,
-                target=target_var,
-                name="VAR",
-            )
+def list_ports_helper():
+    ports = [p.device for p in serial.tools.list_ports.comports()]
+    if ports:
+        print("Available serial ports:")
+        for p in ports:
+            print(f"  {p}")
+    else:
+        print("No serial ports detected.")
 
-        # Sanity: must find the key ones
-        if None in (freq_idx, amps_idx, volts_idx, watts_idx):
-            return None
 
-        m = {
-            "VOLTS": volts_idx,
-            "AMPS": amps_idx,
-            "WATTS": watts_idx,
-            "VA": va_idx if va_idx is not None else 0,
-            "VAR": var_idx if var_idx is not None else 0,
-            "FREQ": freq_idx,
-            "ANGLE": angle_idx if angle_idx is not None else 0,
-            "PF": pf_idx if pf_idx is not None else 0,
-        }
+def main():
+    parser = argparse.ArgumentParser(
+        description=(
+            "Continuously read Phase A/B/C Volts, Amps, Watts, VARs from a Radian RD-21 "
+            "every second and save to CSV. Type commands while running (see --help)."
+        ),
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--port", "-p",
+        help="Serial port, e.g. COM5 or /dev/ttyUSB0. Use --list-ports to see options.",
+    )
+    parser.add_argument(
+        "--baud", "-b",
+        type=int, default=9600,
+        help="Baud rate.",
+    )
+    parser.add_argument(
+        "--out", "-o",
+        default=None,
+        help="Output CSV file path. Defaults to radian_rd21_YYYYMMDD_HHMMSS.csv",
+    )
+    parser.add_argument(
+        "--list-ports",
+        action="store_true",
+        help="List available serial ports and exit.",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable DEBUG-level logging (shows raw hex frames).",
+    )
 
-        # Remove zeros (unknown)
-        m = {k: v for k, v in m.items() if v != 0}
+    args = parser.parse_args()
 
-        self.metric_map = m
-        return m
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
 
-    # ── Public API ──────────────────────────────────────────────────────────────
+    if args.list_ports:
+        list_ports_helper()
+        sys.exit(0)
 
-    def read_instant_3phase(self) -> Optional[List[PhaseReading]]:
-        """
-        Preferred:
-          - if metric_map not known: autodetect via [0Dh]
-          - read via [0Dh] again and pull indices
-        Fallback:
-          - use [2Eh] per-index reads (less reliable on your unit)
-        """
-        if not self.is_connected():
-            return None
+    if not args.port:
+        parser.error("--port is required. Use --list-ports to see available ports.")
 
-        # Try to build map with bulk read first
-        if self.metric_map is None:
-            m = self.autodetect_metric_map()
-            if m is not None:
-                log.info("RD-21 metric index map (auto): %s", m)
+    out_path = args.out or default_csv_name()
 
-        # If we have a bulk-map, read bulk and extract
-        if self.metric_map is not None:
-            metrics = self._read_inst_block_0d()
-            if metrics is None:
-                # bulk read stopped working; fall back
-                self.metric_map = None
-            else:
-                def get_metric(idx_1based: int) -> Tuple[float, float, float]:
-                    slots = metrics[idx_1based - 1]
-                    return self._map_slots_to_phases(slots)
+    run(
+        port     = args.port,
+        baud     = args.baud,
+        out_path = out_path,
+    )
 
-                try:
-                    v = get_metric(self.metric_map["VOLTS"])
-                    a = get_metric(self.metric_map["AMPS"])
-                    w = get_metric(self.metric_map["WATTS"])
-                    va = get_metric(self.metric_map.get("VA", self.metric_map["WATTS"]))
-                    var = get_metric(self.metric_map.get("VAR", self.metric_map["WATTS"]))
-                    f = get_metric(self.metric_map["FREQ"])
-                    ang = get_metric(self.metric_map.get("ANGLE", self.metric_map["FREQ"]))
-                    pf = get_metric(self.metric_map.get("PF", self.metric_map["FREQ"]))
-                except Exception:
-                    return None
 
-                phases: List[PhaseReading] = []
-                for i, label in enumerate(("A", "B", "C")):
-                    phases.append(PhaseReading(
-                        phase=label,
-                        volt=v[i],
-                        amp=a[i],
-                        watt=w[i],
-                        va=va[i],
-                        var=var[i],
-                        frequency=f[i],
-                        phase_angle=ang[i],
-                        power_factor=pf[i],
-                    ))
-                return phases
-
-        # Fallback: [2Eh] reads
-        # NOTE: these are the ones that give you 0.0 volts on your unit sometimes.
-        v = self._read_inst_metric_2e(1)
-        a = self._read_inst_metric_2e(2)
-        w = self._read_inst_metric_2e(3)
-        va = self._read_inst_metric_2e(4)
-        var = self._read_inst_metric_2e(5)
-        f = self._read_inst_metric_2e(6)
-        ang = self._read_inst_metric_2e(7)
-        pf = self._read_inst_metric_2e(8)
-
-        if not all([v, a, w, va, var, f, ang, pf]):
-            return None
-
-        phases: List[PhaseReading] = []
-        for i, label in enumerate(("A", "B", "C")):
-            phases.append(PhaseReading(
-                phase=label,
-                volt=v[i],
-                amp=a[i],
-                watt=w[i],
-                va=va[i],
-                var=var[i],
-                frequency=f[i],
-                phase_angle=ang[i],
-                power_factor=pf[i],
-            ))
-        return phases
+if __name__ == "__main__":
+    main()
